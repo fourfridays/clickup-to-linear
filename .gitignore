@@ -1,3 +1,4 @@
 .env
 migration_log.json
 .DS_Store
+.vscode
