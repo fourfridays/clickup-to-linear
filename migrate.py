@@ -13,6 +13,8 @@ Mapping:
   ClickUp Priority -> Linear Priority
   Time Tracking   ->  estimate
   dueDate         ->  dueDate
+  date_created    ->  createdAt
+  date_closed     ->  completedAt
 
 Usage:
   export CLICKUP_API_TOKEN=...
@@ -22,14 +24,16 @@ Usage:
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from typing import Optional
+from typing import Optional, Dict, List, Any
 import requests
+import logging
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -38,10 +42,36 @@ import requests
 CLICKUP_API_BASE = "https://api.clickup.com/api/v2"
 LINEAR_API_BASE = "https://api.linear.app/graphql"
 DEFAULT_TEAM_NAME = "Migrated from ClickUp"
+API_TIMEOUT = 30
+RATE_LIMIT_DELAY = 0.1  # seconds between API calls
+BATCH_RATE_LIMIT_INTERVAL = 10  # number of operations before rate limit delay
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s'
+)
+logger = logging.getLogger(__name__)
+API_TIMEOUT = 30
+RATE_LIMIT_DELAY = 0.1  # seconds between API calls
+BATCH_RATE_LIMIT_INTERVAL = 10  # number of operations before rate limit delay
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _log_section(title: str, dry_run: bool = False) -> None:
+    """Print a formatted section header for logging."""
+    prefix = "[DRY-RUN] " if dry_run else ""
+    logger.info(f"\n{prefix}=== {title} ===")
 
 
 def load_env(path: str) -> None:
@@ -62,46 +92,83 @@ def load_env(path: str) -> None:
                 os.environ[key] = value
 
 
-def clickup_get(url: str, token: str, params=None) -> list:
-    """Paginate through a ClickUp list endpoint and return all results."""
-    all_items = []
+def clickup_get(url: str, token: str, params: Optional[Dict] = None) -> List[Dict[str, Any]]:
+    """Paginate through a ClickUp list endpoint and return all results.
+    
+    Args:
+        url: ClickUp API endpoint URL
+        token: ClickUp API token
+        params: Optional query parameters
+        
+    Returns:
+        List of items from the paginated endpoint
+    """
+    all_items: List[Dict[str, Any]] = []
     params = params or {}
     headers = {
         "accept": "application/json",
         "Authorization": token
     }
+    
+    # List of possible item keys ClickUp returns
+    item_keys = ["lists", "tasks", "spaces", "teams"]
+    
     while url:
-        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp = requests.get(url, headers=headers, params=params, timeout=API_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
-        items = (data.get("lists") or data.get("tasks") or
-                 data.get("spaces") or data.get("teams") or [])
+        
+        # Handle single task response
         if isinstance(data.get("task"), dict):
             return data
+        
+        # Extract items from response (try multiple possible keys)
+        items = next((data.get(key, []) for key in item_keys if key in data), [])
         all_items.extend(items)
+        
+        # Check for pagination
         cursor = data.get("cursor")
         params = None
         if cursor:
             url = f"{CLICKUP_API_BASE}/{cursor}"
+            time.sleep(RATE_LIMIT_DELAY)
         else:
             break
+    
     return all_items
 
 
-def linear_query(token: str, query: str, variables=None) -> dict:
-    """Execute a Linear GraphQL query/mutation."""
+def linear_query(token: str, query: str, variables: Optional[Dict] = None) -> Dict[str, Any]:
+    """Execute a Linear GraphQL query/mutation.
+    
+    Args:
+        token: Linear API token
+        query: GraphQL query or mutation string
+        variables: Optional GraphQL variables
+        
+    Returns:
+        Response data from Linear API
+        
+    Raises:
+        RuntimeError: If API request fails
+    """
     headers = {"Authorization": token}
+    time.sleep(RATE_LIMIT_DELAY)
+    
     resp = requests.post(
         LINEAR_API_BASE,
         headers=headers,
         json={"query": query, "variables": variables or {}},
-        timeout=30,
+        timeout=API_TIMEOUT,
     )
+    
     if resp.status_code != 200:
         raise RuntimeError(f"Linear API error {resp.status_code}: {resp.text[:500]}")
+    
     data = resp.json()
     if data.get("errors"):
         raise RuntimeError(f"Linear API error: {data['errors']}")
+    
     return data["data"]
 
 
@@ -110,33 +177,46 @@ def linear_query(token: str, query: str, variables=None) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def fetch_clickup_data(token: str, dry_run: bool) -> dict:
+def _log_section(title: str, dry_run: bool = False) -> None:
+    """Print a section header for logging."""
+    prefix = "[DRY-RUN] " if dry_run else ""
+    logger.info(f"\n{prefix}=== {title} ===")
+
+
+def fetch_clickup_data(token: str, dry_run: bool) -> Dict[str, Any]:
     """Fetch all teams, spaces, lists, and tasks from ClickUp.
 
     ClickUp hierarchy: Teams -> Spaces -> Lists -> Tasks
+    
+    Args:
+        token: ClickUp API token
+        dry_run: If True, don't make actual API calls
+        
+    Returns:
+        Dictionary containing spaces, space_lists, and tasks
     """
-    prefix = "[DRY-RUN] " if dry_run else ""
-    print(f"\n{prefix}=== Fetching ClickUp data ===\n")
+    _log_section("Fetching ClickUp data", dry_run)
+    logger.info("")
 
     # 1. Teams
-    print("  Fetching teams ...")
+    logger.info("  Fetching teams ...")
     teams = clickup_get(f"{CLICKUP_API_BASE}/team", token)
-    print(f"    Found {len(teams)} team(s).")
+    logger.info(f"    Found {len(teams)} team(s).")
 
     # 2. Spaces per team
     all_spaces = []
     for team in teams:
         tid = str(team["id"])
         tname = team.get("name", f"Team {tid}")
-        print(f"    Fetching spaces for team '{tname}' ...")
+        logger.info(f"    Fetching spaces for team '{tname}' ...")
         spaces = clickup_get(f"{CLICKUP_API_BASE}/team/{tid}/space", token)
         for s in spaces:
             s["_team_id"] = tid
             s["_team_name"] = tname
         all_spaces.extend(spaces)
-        print(f"      {len(spaces)} space(s).")
+        logger.info(f"      {len(spaces)} space(s).")
 
-    print(f"    Total: {len(all_spaces)} space(s) across {len(teams)} team(s).")
+    logger.info(f"    Total: {len(all_spaces)} space(s) across {len(teams)} team(s).")
 
     # 3. Lists per space
     space_lists = {}
@@ -161,31 +241,21 @@ def fetch_clickup_data(token: str, dry_run: bool) -> dict:
                 token,
                 params={"include_closed": "true"},
             )
+            # Attach metadata to each task
             for t in tasks:
                 t["_space_id"] = sid
                 t["_list_id"] = lid
                 t["_list_name"] = lst_name
             all_tasks.extend(tasks)
             task_count += len(tasks)
-            print(f"      {len(tasks)} task(s).")
+            logger.info(f"      {len(tasks)} task(s).")
 
-    print(f"\n{prefix}Total: {len(teams)} team(s), "
-          f"{len(all_spaces)} space(s), "
-          f"{sum(len(v) for v in space_lists.values())} list(s), "
-          f"{task_count} task(s).")
-
-    # Debug: print first task fields
-    if all_tasks:
-        t = all_tasks[0]
-        print(f"\n  [DEBUG] Sample task '{t.get('name')}':")
-        print(f"    status type={type(t.get('status')).__name__} value={t.get('status')}")
-        print(f"    priority type={type(t.get('priority')).__name__} value={t.get('priority')}")
-        # Print all date-related keys
-        date_keys = [k for k in t.keys() if 'date' in k.lower() or 'due' in k.lower() or 'start' in k.lower()]
-        print(f"    date-related keys: {date_keys}")
-        for dk in date_keys:
-            print(f"      {dk} type={type(t.get(dk)).__name__} value={t.get(dk)}")
-        print(f"    time_tracking={t.get('time_tracking')}")
+    prefix = "[DRY-RUN] " if dry_run else ""
+    total_lists = sum(len(v) for v in space_lists.values())
+    logger.info(f"\n{prefix}Total: {len(teams)} team(s), "
+                f"{len(all_spaces)} space(s), "
+                f"{total_lists} list(s), "
+                f"{task_count} task(s).")
 
     return {"spaces": all_spaces, "space_lists": space_lists, "tasks": all_tasks}
 
@@ -260,6 +330,8 @@ mutation CreateIssue(
   $labelIds: [String!]
   $estimate: Int
   $dueDate: TimelessDate
+  $createdAt: DateTime
+    $completedAt: DateTime
 ) {
   issueCreate(input: {
     teamId: $teamId
@@ -271,9 +343,11 @@ mutation CreateIssue(
     labelIds: $labelIds
     estimate: $estimate
     dueDate: $dueDate
+    createdAt: $createdAt
+        completedAt: $completedAt
   }) {
     success
-    issue { id identifier url }
+    issue { id identifier url completedAt }
   }
 }
 """
@@ -296,40 +370,45 @@ def sanitize_name(name: str, max_len: int = 80) -> str:
     return name.replace('"', '').replace('\\', '').replace('\n', ' ').strip()[:max_len]
 
 
-def setup_linear(token: str, dry_run: bool) -> dict:
-    """Create/find team, fetch states in Linear."""
+def setup_linear(token: str, dry_run: bool) -> Dict[str, Any]:
+    """Create/find team, fetch states in Linear.
+    
+    Args:
+        token: Linear API token
+        dry_run: If True, use mock data instead of API calls
+        
+    Returns:
+        Dictionary with team_id, state_map, and default_state
+    """
+    _log_section("Setting up Linear", dry_run)
     prefix = "[DRY-RUN] " if dry_run else ""
-    print(f"\n{prefix}=== Setting up Linear ===\n")
 
     # 1. Find or create the default team
-    print(f"{prefix}Finding or creating team '{DEFAULT_TEAM_NAME}' ...")
+    logger.info(f"{prefix}Finding or creating team '{DEFAULT_TEAM_NAME}' ...")
     if not dry_run:
         data = linear_query(token, GET_TEAM_QUERY)
         teams = data.get("teams", {}).get("nodes", [])
     else:
         teams = []
 
-    team = None
-    for t in teams:
-        if t["name"] == DEFAULT_TEAM_NAME:
-            team = t
-            break
+    # Look for existing team or create new one
+    team = next((t for t in teams if t["name"] == DEFAULT_TEAM_NAME), None)
 
     if team is None:
-        print(f"  Creating team '{DEFAULT_TEAM_NAME}' ...")
+        logger.info(f"  Creating team '{DEFAULT_TEAM_NAME}' ...")
         if not dry_run:
             data = linear_query(token, CREATE_TEAM_MUTATION, {"name": DEFAULT_TEAM_NAME})
             team = data["teamCreate"]["team"]
         else:
             team = {"id": "dry-run-team-id", "name": DEFAULT_TEAM_NAME}
-        print(f"    Created (id: {team['id']})")
+        logger.info(f"    Created (id: {team['id']})")
     else:
-        print(f"    Found existing team (id: {team['id']})")
+        logger.info(f"    Found existing team (id: {team['id']})")
 
     team_id = team["id"]
 
     # 2. Fetch team states
-    print(f"{prefix}Fetching team states ...")
+    logger.info(f"{prefix}Fetching team states ...")
     if not dry_run:
         states = linear_query(token, GET_STATES_QUERY, {"teamId": team_id})["team"]["states"]["nodes"]
     else:
@@ -339,64 +418,47 @@ def setup_linear(token: str, dry_run: bool) -> dict:
             {"id": "s-done", "name": "Done"},
         ]
 
-    # Build state lookup by name (case-insensitive)
-    state_map = {}
-    for s in states:
-        name_lower = s.get("name", "").lower()
-        if "done" in name_lower:
-            state_map["done"] = s["id"]
-        elif "in progress" in name_lower:
-            state_map["in_progress"] = s["id"]
-        elif "backlog" in name_lower:
-            state_map["backlog"] = s["id"]
-        elif "unstarted" in name_lower:
-            state_map["unstarted"] = s["id"]
-
-    # Ensure we have all keys
-    if "in_progress" not in state_map:
-        state_map["in_progress"] = state_map.get("unstarted", states[0]["id"])
-    if "unstarted" not in state_map:
-        state_map["unstarted"] = state_map.get("backlog", states[0]["id"])
-    if "done" not in state_map:
-        state_map["done"] = states[-1]["id"]
-
-    default_state = state_map["backlog"]
-    print(f"    States: {', '.join(f'{k}={v}' for k, v in state_map.items())}")
-    print(f"    Default: {default_state}")
+    # Map states by category (case-insensitive matching)
+    state_map = _build_state_map(states)
+    default_state = state_map.get("backlog", states[0]["id"] if states else "")
+    
+    logger.info(f"    States: {', '.join(f'{k}={v}' for k, v in state_map.items())}")
+    logger.info(f"    Default: {default_state}")
 
     return {"team_id": team_id, "state_map": state_map, "default_state": default_state}
 
 
 def create_projects(token: str, team_id: str, spaces: list, dry_run: bool) -> dict:
     """Create a Linear project per ClickUp space."""
-    prefix = "[DRY-RUN] " if dry_run else ""
-    print(f"\n{prefix}=== Creating projects (one per space) ===\n")
+    _log_section("Creating projects (one per space)", dry_run)
+    logger.info("")
 
     space_to_project = {}
     for space in spaces:
         sid = str(space["id"])
         name = sanitize_name(space.get("name", f"Space {sid}"))
-        print(f"  Project: '{name}' ...")
+        logger.info(f"  Project: '{name}' ...")
 
         if dry_run:
             space_to_project[sid] = f"dry-run-project-{sid}"
-            print(f"    [DRY-RUN] Would create project")
+            logger.info(f"    [DRY-RUN] Would create project")
             continue
 
         data = linear_query(token, CREATE_PROJECT_MUTATION,
                             {"teamIds": [team_id], "name": name})
         project = data["projectCreate"]["project"]
         space_to_project[sid] = project["id"]
-        print(f"    Created (id: {project['id']})")
+        logger.info(f"    Created (id: {project['id']})")
 
     return space_to_project
 
 
 def sync_labels(token: str, team_id: str, all_tasks: list, dry_run: bool) -> dict:
     """Collect all unique tags across tasks, create labels in Linear."""
-    prefix = "[DRY-RUN] " if dry_run else ""
-    print(f"\n{prefix}=== Syncing labels (from ClickUp tags) ===\n")
+    _log_section("Syncing labels (from ClickUp tags)", dry_run)
+    logger.info("")
 
+    # Collect all unique tags from tasks
     tag_set = set()
     for task in all_tasks:
         for tag in task.get("tags", []):
@@ -404,7 +466,7 @@ def sync_labels(token: str, team_id: str, all_tasks: list, dry_run: bool) -> dic
             if tag_name:
                 tag_set.add(tag_name.lower())
 
-    print(f"  Found {len(tag_set)} unique tag(s).")
+    logger.info(f"  Found {len(tag_set)} unique tag(s).")
 
     if not dry_run:
         labels_data = linear_query(token, GET_LABELS_QUERY, {"teamId": team_id})
@@ -423,11 +485,11 @@ def sync_labels(token: str, team_id: str, all_tasks: list, dry_run: bool) -> dic
             continue
         color = LABEL_COLORS[color_idx % len(LABEL_COLORS)]
         color_idx += 1
-        print(f"  Label: '{tag_name}' ...")
+        logger.info(f"  Label: '{tag_name}' ...")
 
         if dry_run:
             label_map[tag_name] = f"dry-run-label-{tag_name}"
-            print(f"    [DRY-RUN] Would create label")
+            logger.info(f"    [DRY-RUN] Would create label")
             continue
 
         try:
@@ -435,11 +497,51 @@ def sync_labels(token: str, team_id: str, all_tasks: list, dry_run: bool) -> dic
                                 {"teamId": team_id, "name": tag_name, "color": color})
             label = data["issueLabelCreate"]["issueLabel"]
             label_map[tag_name] = label["id"]
-            print(f"    Created (id: {label['id']})")
+            logger.info(f"    Created (id: {label['id']})")
         except Exception as e:
-            print(f"    Skipped: {e}")
+            logger.warning(f"    Skipped: {e}")
 
     return label_map
+
+
+# ---------------------------------------------------------------------------
+# Utility helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_state_map(states: list) -> dict:
+    """Build a category-based state mapping from Linear states.
+    
+    Creates a robust mapping that handles variations in state names.
+    """
+    state_map = {}
+    for s in states:
+        name_lower = s.get("name", "").lower()
+        state_id = s["id"]
+        
+        # Map by category (first match wins)
+        if "done" in name_lower or "complete" in name_lower or "closed" in name_lower:
+            if "done" not in state_map:
+                state_map["done"] = state_id
+        elif "in progress" in name_lower or "active" in name_lower:
+            if "in_progress" not in state_map:
+                state_map["in_progress"] = state_id
+        elif "backlog" in name_lower or "todo" in name_lower:
+            if "backlog" not in state_map:
+                state_map["backlog"] = state_id
+        elif "unstarted" in name_lower:
+            if "unstarted" not in state_map:
+                state_map["unstarted"] = state_id
+    
+    # Ensure required keys with fallbacks
+    if "in_progress" not in state_map and states:
+        state_map["in_progress"] = state_map.get("backlog", states[0]["id"])
+    if "backlog" not in state_map and states:
+        state_map["backlog"] = states[0]["id"]
+    if "done" not in state_map and states:
+        state_map["done"] = states[-1]["id"]
+    
+    return state_map
 
 
 # ---------------------------------------------------------------------------
@@ -514,8 +616,13 @@ def map_status(status_name: str, state_map: dict, default_state: str) -> str:
         return default_state
 
 
-def format_description(task: dict) -> str:
-    """Build a Markdown description from ClickUp task fields."""
+def format_description(task: dict, completed_at: Optional[str] = None) -> str:
+    """Build a Markdown description from ClickUp task fields.
+    
+    Args:
+        task: ClickUp task dict
+        completed_at: Original completion date from ClickUp (for reference when Linear sets completion to "now")
+    """
     parts = []
 
     content = task.get("content", "") or task.get("description", "")
@@ -523,9 +630,18 @@ def format_description(task: dict) -> str:
         parts.append(content)
 
     custom_fields = task.get("custom_fields", [])
-    if custom_fields:
+    # Filter custom fields to only include those with non-None values
+    fields_with_values = []
+    for cf in custom_fields:
+        value = cf.get("value")
+        # Skip None values and empty lists
+        if value is None or (isinstance(value, list) and not value):
+            continue
+        fields_with_values.append(cf)
+    
+    if fields_with_values:
         parts.append("## Custom Fields")
-        for cf in custom_fields:
+        for cf in fields_with_values:
             name = cf.get("name", "Unnamed")
             value = cf.get("value")
             if isinstance(value, list):
@@ -550,22 +666,48 @@ def format_description(task: dict) -> str:
             hours = total / 3600
             parts.append(f"\n> Time tracked: {hours:.1f}h")
 
+    # Add original completion date as metadata for reference
+    # (Linear sets completedAt to current time, this preserves the original ClickUp date)
+    if completed_at:
+        parts.append(f"\n> Completed in ClickUp: {completed_at}")
+
     return "\n\n".join(parts)
 
 
-def parse_clickup_date(task: dict, field: str) -> Optional[str]:
+def parse_clickup_date(task: dict, field: str, as_datetime: bool = False) -> Optional[str]:
     """Extract and convert a date from ClickUp task.
     
     ClickUp uses snake_case field names: due_date, start_date, date_closed, etc.
     Values are string epoch-ms like "1779004800000".
+    
+    Args:
+        task: ClickUp task dict
+        field: Field name to extract (e.g. "dueDate", "date_created")
+        as_datetime: If True, returns ISO 8601 datetime (for Linear DateTime type).
+                     If False, returns date-only (for Linear TimelessDate type).
     """
-    # Try multiple possible field names (ClickUp uses snake_case)
-    candidates = [field, f"{field}_utc",
-                  field.replace("dueDate", "due_date"),
-                  field.replace("dueDate", "due_date_utc"),
-                  field.replace("startDate", "start_date"),
-                  field.replace("startDate", "start_date_utc"),
-                  "due_date", "start_date"]
+    # Build comprehensive list of candidate field names
+    candidates = [field, f"{field}_utc"]
+    
+    # Add snake_case versions
+    snake_field = field.replace("dueDate", "due_date") \
+                       .replace("startDate", "start_date") \
+                       .replace("dateCreated", "date_created") \
+                       .replace("dateClosed", "date_closed") \
+                       .replace("dateDone", "date_done")
+    if snake_field != field:
+        candidates.append(snake_field)
+        candidates.append(f"{snake_field}_utc")
+    
+    # Add specific ClickUp field names for different date types
+    if "due" in field.lower():
+        candidates.extend(["due_date", "due_date_utc"])
+    elif "closed" in field.lower() or "done" in field.lower() or "complete" in field.lower():
+        candidates.extend(["date_closed", "date_closed_utc", "date_done", "date_done_utc"])
+    elif "created" in field.lower():
+        candidates.extend(["date_created", "date_created_utc"])
+    elif "start" in field.lower():
+        candidates.extend(["start_date", "start_date_utc"])
     
     ts = None
     for c in candidates:
@@ -583,6 +725,8 @@ def parse_clickup_date(task: dict, field: str) -> Optional[str]:
     try:
         # ClickUp returns dates as string epoch-ms
         dt = datetime.fromtimestamp(float(str(ts)) / 1000, tz=timezone.utc)
+        if as_datetime:
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         return dt.strftime("%Y-%m-%d")
     except (OSError, ValueError, OverflowError, TypeError):
         return None
@@ -607,6 +751,55 @@ def extract_time_tracking_seconds(task) -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 
+def _build_issue_variables(
+    team_id: str,
+    project_id: str,
+    title: str,
+    description: Optional[str],
+    priority: Optional[int],
+    state_id: str,
+    tag_ids: list,
+    estimate: Optional[int],
+    due_date: Optional[str],
+    created_at: Optional[str],
+    closed_at: Optional[str],
+) -> dict:
+    """Build GraphQL variables for issue creation mutation.
+    
+    Only includes fields that have values to keep mutations lean.
+    Linear accepts completedAt on create, but requires createdAt to be present too.
+    """
+    variables = {
+        "teamId": team_id,
+        "title": title,
+        "stateId": state_id,
+    }
+    
+    if project_id:
+        variables["projectId"] = project_id
+    if description:
+        variables["description"] = description
+    if priority is not None:
+        variables["priority"] = priority
+    if tag_ids:
+        variables["labelIds"] = tag_ids
+    if estimate is not None:
+        variables["estimate"] = estimate
+    if due_date:
+        variables["dueDate"] = due_date
+    if created_at:
+        variables["createdAt"] = created_at
+    if closed_at and created_at:
+        variables["completedAt"] = closed_at
+    
+    return variables
+
+
+# ---------------------------------------------------------------------------
+# Main migration
+# ---------------------------------------------------------------------------
+
+
 def migrate_tasks(
     token: str,
     team_id: str,
@@ -617,107 +810,134 @@ def migrate_tasks(
     tasks: list,
     dry_run: bool,
 ) -> list:
-    """Create Linear issues for each ClickUp task."""
-    prefix = "[DRY-RUN] " if dry_run else ""
-    print(f"\n{prefix}=== Migrating tasks ===\n")
+    """Create Linear issues for each ClickUp task.
+    
+    Args:
+        token: Linear API token
+        team_id: Linear team ID
+        space_to_project: Mapping of ClickUp space IDs to Linear project IDs
+        label_map: Mapping of tag names to Linear label IDs
+        state_map: Mapping of status categories to Linear state IDs
+        default_state: Default Linear state ID for unmapped statuses
+        tasks: List of ClickUp tasks to migrate
+        dry_run: If True, preview without making API calls
+        
+    Returns:
+        List of migration results with status and details
+    """
+    _log_section("Migrating tasks", dry_run)
+    logger.info("")
 
     results = []
     skipped = 0
+    debug_limit = 3  # Show debug info for first N tasks
 
     for idx, task in enumerate(tasks, 1):
         title = sanitize_name(task.get("name", "Untitled"))
         sid = str(task.get("_space_id", ""))
         project_id = space_to_project.get(sid, "")
 
+        # Skip tasks without project mapping
         if not project_id:
-            print(f"  [{idx}/{len(tasks)}] SKIP '{title}' - no project mapping")
+            logger.debug(f"  [{idx}/{len(tasks)}] SKIP '{title}' - no project mapping")
             results.append({"title": title, "status": "skipped", "reason": "no project"})
             skipped += 1
             continue
 
-        # Parent task (subtask) - skip for now
+        # Skip subtasks (parent task relationships) for now
         if task.get("parent"):
+            logger.debug(f"  [{idx}/{len(tasks)}] SKIP '{title}' - subtask")
             results.append({"title": title, "status": "skipped", "reason": "subtask"})
             skipped += 1
             continue
 
-        # Priority
+        # Extract task fields
         priority = map_priority(extract_clickup_priority(task))
-
-        # Status
         status_name = extract_clickup_status(task)
         state_id = map_status(status_name, state_map, default_state)
+        
+        # Extract labels
+        tag_ids = [
+            label_map[tag.get("name", "").strip().lower()]
+            for tag in task.get("tags", [])
+            if tag.get("name", "").strip().lower() in label_map
+        ]
 
-        # Labels
-        tag_ids = []
-        for tag in task.get("tags", []):
-            tag_name = tag.get("name", "").strip().lower()
-            if tag_name in label_map:
-                tag_ids.append(label_map[tag_name])
-
-        # Estimate (minutes from tracked seconds)
+        # Extract estimate (convert seconds to minutes)
         total_seconds = extract_time_tracking_seconds(task)
         estimate = round(total_seconds / 60) if total_seconds else None
 
-        # Dates
+        # Extract dates
         due_date = parse_clickup_date(task, "dueDate")
+        created_at = parse_clickup_date(task, "date_created", as_datetime=True)
+        closed_at = parse_clickup_date(task, "date_closed", as_datetime=True)
+        if closed_at and not created_at:
+            logger.warning(
+                f"  [{idx}/{len(tasks)}] '{title}' has completion date but no created date; "
+                "skipping completedAt for API compatibility"
+            )
 
-        # Debug: print first 3 tasks with dates
-        if idx <= 3:
-            date_keys = [k for k in task.keys() if 'date' in k.lower() or 'due' in k.lower() or 'start' in k.lower()]
-            print(f"  [DEBUG] Task {idx} date keys: {date_keys}")
-            for dk in date_keys:
-                print(f"    {dk} = {task.get(dk)}")
+        # Log debug info for first few tasks
+        if idx <= debug_limit and logger.isEnabledFor(logging.DEBUG):
+            date_keys = [k for k in task.keys() if 'date' in k.lower() or 'due' in k.lower()]
+            logger.debug(f"  [DEBUG] Task {idx}: {date_keys}")
+            logger.debug(f"    Parsed: due={due_date}, created={created_at}, closed={closed_at}")
 
-        # Description
-        description = format_description(task)
+        # Format description
+        description = format_description(task, completed_at=closed_at if state_id == state_map.get("done") else None)
 
+        # Dry-run mode: preview only
         if dry_run:
-            print(f"  [{idx}/{len(tasks)}] [DRY-RUN] '{title}'")
-            print(f"         project={project_id} priority={priority} state={state_id}")
+            summary = f"  [{idx}/{len(tasks)}] [DRY-RUN] '{title}' -> {state_id}"
             if estimate:
-                print(f"         estimate={estimate}min")
-            if due_date:
-                print(f"         due={due_date}")
+                summary += f" ({estimate}min)"
+            if closed_at:
+                summary += f" [completed: {closed_at}]"
+            elif due_date:
+                summary += f" [due: {due_date}]"
+            logger.info(summary)
             results.append({"title": title, "status": "would_create"})
             continue
 
-        # Build GraphQL variables
-        issue_vars = {
-            "teamId": team_id,
-            "title": title,
-            "stateId": state_id,
-        }
-        if tag_ids:
-            issue_vars["labelIds"] = tag_ids
-        if project_id:
-            issue_vars["projectId"] = project_id
-        if description:
-            issue_vars["description"] = description
-        if priority is not None:
-            issue_vars["priority"] = priority
-        if estimate is not None:
-            issue_vars["estimate"] = estimate
-        if due_date:
-            issue_vars["dueDate"] = due_date
+        # Build GraphQL variables for creation
+        issue_vars = _build_issue_variables(
+            team_id, project_id, title, description,
+            priority, state_id, tag_ids, estimate,
+            due_date, created_at, closed_at
+        )
 
+        # Create issue in Linear
         try:
+            # Log the variables being sent (for debugging)
+            logger.debug(f"    GraphQL variables: {issue_vars}")
+            
             data = linear_query(token, CREATE_ISSUE_MUTATION, issue_vars)
             issue = data["issueCreate"]["issue"]
-            print(f"  [{idx}/{len(tasks)}] OK '{title}' -> {issue['identifier']}")
-            results.append({
-                "title": title,
-                "status": "created",
-                "identifier": issue.get("identifier"),
-                "url": issue.get("url"),
-            })
+            
+            # Check if issue was created successfully
+            if issue and issue.get("id"):
+                completed_info = ""
+                if issue.get("completedAt"):
+                    completed_info = f" [completed: {issue['completedAt']}]"
+                logger.info(f"  [{idx}/{len(tasks)}] OK '{title}' -> {issue['identifier']}{completed_info}")
+                
+                results.append({
+                    "title": title,
+                    "status": "created",
+                    "identifier": issue.get("identifier"),
+                    "url": issue.get("url"),
+                })
+            else:
+                logger.error(f"  [{idx}/{len(tasks)}] FAIL '{title}' - issue not created (no ID returned)")
+                results.append({"title": title, "status": "error", "reason": "no issue ID returned"})
+
         except Exception as e:
-            print(f"  [{idx}/{len(tasks)}] FAIL '{title}' - {e}")
+            logger.error(f"  [{idx}/{len(tasks)}] FAIL '{title}' - {e}")
             results.append({"title": title, "status": "error", "reason": str(e)})
             skipped += 1
 
-        # Rate limiting
-        if idx % 10 == 0:
+        # Batch rate limiting
+        if idx % BATCH_RATE_LIMIT_INTERVAL == 0:
             time.sleep(0.5)
 
     return results

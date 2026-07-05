@@ -13,6 +13,8 @@ Migrates all ClickUp spaces, tasks, tags, statuses, dates, and time tracking int
 | Priority | Priority |
 | Time Tracking (seconds) | `estimateMinutes` |
 | `startDate` / `dueDate` | `startAt` / `dueAt` |
+| `date_created`          | `createdAt`       |
+| `date_closed`           | `completedAt`     |
 
 ## Setup
 
