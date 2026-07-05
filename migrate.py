@@ -159,6 +159,7 @@ def fetch_clickup_data(token: str, dry_run: bool) -> dict:
             tasks = clickup_get(
                 f"{CLICKUP_API_BASE}/list/{lid}/task",
                 token,
+                params={"include_closed": "true"},
             )
             for t in tasks:
                 t["_space_id"] = sid
@@ -173,14 +174,18 @@ def fetch_clickup_data(token: str, dry_run: bool) -> dict:
           f"{sum(len(v) for v in space_lists.values())} list(s), "
           f"{task_count} task(s).")
 
-    # Debug: print first task status/priority format
+    # Debug: print first task fields
     if all_tasks:
         t = all_tasks[0]
         print(f"\n  [DEBUG] Sample task '{t.get('name')}':")
         print(f"    status type={type(t.get('status')).__name__} value={t.get('status')}")
         print(f"    priority type={type(t.get('priority')).__name__} value={t.get('priority')}")
+        # Print all date-related keys
+        date_keys = [k for k in t.keys() if 'date' in k.lower() or 'due' in k.lower() or 'start' in k.lower()]
+        print(f"    date-related keys: {date_keys}")
+        for dk in date_keys:
+            print(f"      {dk} type={type(t.get(dk)).__name__} value={t.get(dk)}")
         print(f"    time_tracking={t.get('time_tracking')}")
-        print(f"    custom_fields={t.get('custom_fields')}")
 
     return {"spaces": all_spaces, "space_lists": space_lists, "tasks": all_tasks}
 
@@ -445,14 +450,21 @@ def sync_labels(token: str, team_id: str, all_tasks: list, dry_run: bool) -> dic
 def extract_clickup_priority(task) -> Optional[int]:
     """Extract priority int from ClickUp task.
 
-    ClickUp returns priority as either an int or a dict like {"priority": 1}.
+    ClickUp returns priority as either an int or a dict like {"priority": "high"}.
     """
     p = task.get("priority")
     if p is None:
         return None
     if isinstance(p, dict):
-        return p.get("priority")
-    return p
+        p = p.get("priority")
+    if p is None:
+        return None
+    # ClickUp can return string names or integers
+    if isinstance(p, str):
+        mapping = {"urgent": 0, "high": 1, "medium": 2, "low": 3,
+                   "red": 0, "yellow": 1, "blue": 2, "green": 3}
+        return mapping.get(p.lower())
+    return int(p) if p else None
 
 
 def extract_clickup_status(task) -> str:
@@ -541,14 +553,38 @@ def format_description(task: dict) -> str:
     return "\n\n".join(parts)
 
 
-def parse_clickup_date(ts) -> Optional[str]:
-    """Convert ClickUp epoch-ms to ISO 8601 date string (YYYY-MM-DD)."""
+def parse_clickup_date(task: dict, field: str) -> Optional[str]:
+    """Extract and convert a date from ClickUp task.
+    
+    ClickUp uses snake_case field names: due_date, start_date, date_closed, etc.
+    Values are string epoch-ms like "1779004800000".
+    """
+    # Try multiple possible field names (ClickUp uses snake_case)
+    candidates = [field, f"{field}_utc",
+                  field.replace("dueDate", "due_date"),
+                  field.replace("dueDate", "due_date_utc"),
+                  field.replace("startDate", "start_date"),
+                  field.replace("startDate", "start_date_utc"),
+                  "due_date", "start_date"]
+    
+    ts = None
+    for c in candidates:
+        val = task.get(c)
+        if val is not None:
+            ts = val
+            break
+    
+    if ts is None:
+        return None
+    if isinstance(ts, dict):
+        ts = ts.get("date") or ts.get("timestamp")
     if not ts:
         return None
     try:
-        dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
+        # ClickUp returns dates as string epoch-ms
+        dt = datetime.fromtimestamp(float(str(ts)) / 1000, tz=timezone.utc)
         return dt.strftime("%Y-%m-%d")
-    except (OSError, ValueError, OverflowError):
+    except (OSError, ValueError, OverflowError, TypeError):
         return None
 
 
@@ -624,7 +660,14 @@ def migrate_tasks(
         estimate = round(total_seconds / 60) if total_seconds else None
 
         # Dates
-        due_date = parse_clickup_date(task.get("dueDate"))
+        due_date = parse_clickup_date(task, "dueDate")
+
+        # Debug: print first 3 tasks with dates
+        if idx <= 3:
+            date_keys = [k for k in task.keys() if 'date' in k.lower() or 'due' in k.lower() or 'start' in k.lower()]
+            print(f"  [DEBUG] Task {idx} date keys: {date_keys}")
+            for dk in date_keys:
+                print(f"    {dk} = {task.get(dk)}")
 
         # Description
         description = format_description(task)
