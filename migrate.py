@@ -6,7 +6,8 @@ Migrates all spaces, tasks, tags, statuses, dates, and time tracking
 from ClickUp into a fresh Linear workspace.
 
 Mapping:
-  ClickUp Spaces  ->  One Linear Team + each space becomes a Project
+  ClickUp Spaces  ->  One Linear Team each
+  ClickUp Lists   ->  Labels within each team (development, documentation, etc.)
   ClickUp Tasks   ->  Linear Issues
   ClickUp Tags    ->  Linear Labels (created on-demand)
   ClickUp Status  ->  Linear Issue State
@@ -26,6 +27,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -66,12 +68,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _log_section(title: str, dry_run: bool = False) -> None:
-    """Print a formatted section header for logging."""
-    prefix = "[DRY-RUN] " if dry_run else ""
-    logger.info(f"\n{prefix}=== {title} ===")
 
 
 def load_env(path: str) -> None:
@@ -291,15 +287,6 @@ query GetStates($teamId: String!) {
 }
 """
 
-CREATE_PROJECT_MUTATION = """
-mutation CreateProject($teamIds: [String!]!, $name: String!) {
-  projectCreate(input: {teamIds: $teamIds, name: $name}) {
-    success
-    project { id name }
-  }
-}
-"""
-
 GET_LABELS_QUERY = """
 query GetLabels($teamId: String!) {
   team(id: $teamId) {
@@ -322,7 +309,6 @@ mutation CreateLabel($teamId: String!, $name: String!, $color: String!) {
 CREATE_ISSUE_MUTATION = """
 mutation CreateIssue(
   $teamId: String!
-  $projectId: String
   $title: String!
   $description: String
   $priority: Int
@@ -331,11 +317,10 @@ mutation CreateIssue(
   $estimate: Int
   $dueDate: TimelessDate
   $createdAt: DateTime
-    $completedAt: DateTime
+  $completedAt: DateTime
 ) {
   issueCreate(input: {
     teamId: $teamId
-    projectId: $projectId
     title: $title
     description: $description
     priority: $priority
@@ -344,7 +329,7 @@ mutation CreateIssue(
     estimate: $estimate
     dueDate: $dueDate
     createdAt: $createdAt
-        completedAt: $completedAt
+    completedAt: $completedAt
   }) {
     success
     issue { id identifier url completedAt }
@@ -365,97 +350,106 @@ LABEL_COLORS = [
 
 
 def sanitize_name(name: str, max_len: int = 80) -> str:
+    """Sanitize a name for Linear, removing URLs and trailing domain patterns.
+    
+    Linear rejects names containing URLs, so we strip any http/https/ftp URLs
+    and standalone domain-like patterns (e.g. example.com).
+    If the entire name is a domain, replace dots with dashes instead.
+    """
     if not name:
         return "Untitled"
-    return name.replace('"', '').replace('\\', '').replace('\n', ' ').strip()[:max_len]
+    # Strip full URLs
+    name = re.sub(r'https?://[^\s]+', '', name)
+    name = re.sub(r'ftp://[^\s]+', '', name)
+    name = re.sub(r'www\.\S+', '', name)
+    # If the entire name is a domain, replace dots with dashes
+    if re.match(r'^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.(?:com|net|org|io|co|dev|app|info|biz|me|us|uk)\b$', name, flags=re.IGNORECASE):
+        name = name.replace('.', '-')
+        return name.strip()[:max_len]
+    # Strip standalone domain patterns from mixed names (e.g. "project.com extra")
+    name = re.sub(r'\b[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.(?:com|net|org|io|co|dev|app|info|biz|me|us|uk)\b', '', name, flags=re.IGNORECASE)
+    # Strip other problematic characters Linear doesn't like
+    name = name.replace('"', '').replace('\\', '').replace('\n', ' ')
+    # Collapse multiple spaces
+    name = re.sub(r'\s+', ' ', name)
+    return name.strip()[:max_len]
 
 
-def setup_linear(token: str, dry_run: bool) -> Dict[str, Any]:
-    """Create/find team, fetch states in Linear.
+def create_teams_and_states(token: str, spaces: list, dry_run: bool) -> Dict[str, Any]:
+    """Create a Linear team per ClickUp space, fetch states for each.
     
     Args:
         token: Linear API token
+        spaces: List of ClickUp spaces
         dry_run: If True, use mock data instead of API calls
         
     Returns:
-        Dictionary with team_id, state_map, and default_state
+        Dictionary with space_to_team mapping and state maps per team
     """
-    _log_section("Setting up Linear", dry_run)
+    _log_section("Creating Linear teams (one per space)", dry_run)
     prefix = "[DRY-RUN] " if dry_run else ""
 
-    # 1. Find or create the default team
-    logger.info(f"{prefix}Finding or creating team '{DEFAULT_TEAM_NAME}' ...")
-    if not dry_run:
-        data = linear_query(token, GET_TEAM_QUERY)
-        teams = data.get("teams", {}).get("nodes", [])
-    else:
-        teams = []
+    space_to_team: Dict[str, str] = {}
+    team_states: Dict[str, dict] = {}
+    team_default_state: Dict[str, str] = {}
+    seen_team_names: Dict[str, int] = {}
 
-    # Look for existing team or create new one
-    team = next((t for t in teams if t["name"] == DEFAULT_TEAM_NAME), None)
-
-    if team is None:
-        logger.info(f"  Creating team '{DEFAULT_TEAM_NAME}' ...")
-        if not dry_run:
-            data = linear_query(token, CREATE_TEAM_MUTATION, {"name": DEFAULT_TEAM_NAME})
-            team = data["teamCreate"]["team"]
-        else:
-            team = {"id": "dry-run-team-id", "name": DEFAULT_TEAM_NAME}
-        logger.info(f"    Created (id: {team['id']})")
-    else:
-        logger.info(f"    Found existing team (id: {team['id']})")
-
-    team_id = team["id"]
-
-    # 2. Fetch team states
-    logger.info(f"{prefix}Fetching team states ...")
-    if not dry_run:
-        states = linear_query(token, GET_STATES_QUERY, {"teamId": team_id})["team"]["states"]["nodes"]
-    else:
-        states = [
-            {"id": "s-backlog", "name": "Backlog"},
-            {"id": "s-in-progress", "name": "In Progress"},
-            {"id": "s-done", "name": "Done"},
-        ]
-
-    # Map states by category (case-insensitive matching)
-    state_map = _build_state_map(states)
-    default_state = state_map.get("backlog", states[0]["id"] if states else "")
-    
-    logger.info(f"    States: {', '.join(f'{k}={v}' for k, v in state_map.items())}")
-    logger.info(f"    Default: {default_state}")
-
-    return {"team_id": team_id, "state_map": state_map, "default_state": default_state}
-
-
-def create_projects(token: str, team_id: str, spaces: list, dry_run: bool) -> dict:
-    """Create a Linear project per ClickUp space."""
-    _log_section("Creating projects (one per space)", dry_run)
-    logger.info("")
-
-    space_to_project = {}
     for space in spaces:
         sid = str(space["id"])
-        name = sanitize_name(space.get("name", f"Space {sid}"))
-        logger.info(f"  Project: '{name}' ...")
+        space_name = space.get("name", f"Space {sid}")
+        team_name = sanitize_name(space_name)
+        # Deduplicate: if stripping domains produced a collision, append a suffix
+        if team_name in seen_team_names:
+            counter = seen_team_names[team_name]
+            seen_team_names[team_name] += 1
+            team_name = f"{team_name} ({counter})"
+        else:
+            seen_team_names[team_name] = 1
+        logger.info(f"  Team: '{team_name}' ...")
 
         if dry_run:
-            space_to_project[sid] = f"dry-run-project-{sid}"
-            logger.info(f"    [DRY-RUN] Would create project")
+            space_to_team[sid] = f"dry-run-team-{sid}"
+            state_map = _build_state_map([
+                {"id": "s-backlog", "name": "Backlog"},
+                {"id": "s-in-progress", "name": "In Progress"},
+                {"id": "s-done", "name": "Done"},
+            ])
+            team_states[sid] = state_map
+            team_default_state[sid] = state_map["backlog"]
+            logger.info(f"    [DRY-RUN] Would create team")
             continue
 
-        data = linear_query(token, CREATE_PROJECT_MUTATION,
-                            {"teamIds": [team_id], "name": name})
-        project = data["projectCreate"]["project"]
-        space_to_project[sid] = project["id"]
-        logger.info(f"    Created (id: {project['id']})")
+        # Create team
+        data = linear_query(token, CREATE_TEAM_MUTATION, {"name": team_name})
+        team = data["teamCreate"]["team"]
+        team_id = team["id"]
+        space_to_team[sid] = team_id
+        logger.info(f"    Created (id: {team_id})")
 
-    return space_to_project
+        # Fetch states for this team
+        states = linear_query(token, GET_STATES_QUERY, {"teamId": team_id})["team"]["states"]["nodes"]
+        state_map = _build_state_map(states)
+        team_states[sid] = state_map
+        default_state = state_map.get("backlog", states[0]["id"] if states else "")
+        team_default_state[sid] = default_state
+        logger.info(f"    States: {', '.join(f'{k}={v}' for k, v in state_map.items())}")
+
+    return {"space_to_team": space_to_team, "team_states": team_states, "team_default_state": team_default_state}
 
 
-def sync_labels(token: str, team_id: str, all_tasks: list, dry_run: bool) -> dict:
-    """Collect all unique tags across tasks, create labels in Linear."""
-    _log_section("Syncing labels (from ClickUp tags)", dry_run)
+def sync_labels(token: str, space_to_team: dict, all_tasks: list, dry_run: bool) -> dict:
+    """Collect all unique tags across tasks, create labels in each team.
+    
+    Args:
+        token: Linear API token
+        space_to_team: Mapping of space_id -> Linear team_id
+        all_tasks: List of all tasks
+        dry_run: If True, use mock data instead of API calls
+        
+    Returns:
+        Mapping of tag_name -> {team_id: label_id}
+    """
+    _log_section("Syncing tag labels (across all teams)", dry_run)
     logger.info("")
 
     # Collect all unique tags from tasks
@@ -468,40 +462,104 @@ def sync_labels(token: str, team_id: str, all_tasks: list, dry_run: bool) -> dic
 
     logger.info(f"  Found {len(tag_set)} unique tag(s).")
 
-    if not dry_run:
-        labels_data = linear_query(token, GET_LABELS_QUERY, {"teamId": team_id})
-        existing_labels = {
-            l["name"].lower(): l["id"]
-            for l in labels_data.get("team", {}).get("labels", {}).get("nodes", [])
-        }
-    else:
-        existing_labels = {}
+    # Create tag labels in each team
+    # Returns: {tag_name: {team_id: label_id}}
+    tag_label_map: Dict[str, Dict[str, str]] = {}
 
-    label_map = dict(existing_labels)
-    color_idx = 0
+    for team_id in space_to_team.values():
+        logger.info(f"  Team '{team_id}' ...")
+        
+        if not dry_run:
+            labels_data = linear_query(token, GET_LABELS_QUERY, {"teamId": team_id})
+            existing_labels = {
+                l["name"].lower(): l["id"]
+                for l in labels_data.get("team", {}).get("labels", {}).get("nodes", [])
+            }
+        else:
+            existing_labels = {}
 
-    for tag_name in sorted(tag_set):
-        if tag_name in label_map:
+        color_idx = 0
+        for tag_name in sorted(tag_set):
+            if tag_name in existing_labels:
+                continue
+            color = LABEL_COLORS[color_idx % len(LABEL_COLORS)]
+            color_idx += 1
+            logger.info(f"    Label: '{tag_name}' ...")
+
+            if dry_run:
+                if tag_name not in tag_label_map:
+                    tag_label_map[tag_name] = {}
+                tag_label_map[tag_name][team_id] = f"dry-run-label-{tag_name}"
+                logger.info(f"    [DRY-RUN] Would create label")
+                continue
+
+            try:
+                data = linear_query(token, CREATE_LABEL_MUTATION,
+                                    {"teamId": team_id, "name": tag_name, "color": color})
+                label = data["issueLabelCreate"]["issueLabel"]
+                if tag_name not in tag_label_map:
+                    tag_label_map[tag_name] = {}
+                tag_label_map[tag_name][team_id] = label["id"]
+                logger.info(f"    Created (id: {label['id']})")
+            except Exception as e:
+                logger.warning(f"    Skipped: {e}")
+
+    return tag_label_map
+
+
+def create_list_labels(token: str, space_lists: dict, space_to_team: dict, dry_run: bool) -> Dict[str, Dict[str, str]]:
+    """Create labels from ClickUp list names within each Linear team.
+    
+    Args:
+        token: Linear API token
+        space_lists: Mapping of space_id -> list dicts
+        space_to_team: Mapping of space_id -> Linear team_id
+        dry_run: If True, use mock data instead of API calls
+        
+    Returns:
+        Mapping of space_id -> {list_name: label_id}
+    """
+    _log_section("Creating list labels (one per list per space)", dry_run)
+    logger.info("")
+
+    space_to_list_labels: Dict[str, Dict[str, str]] = {}
+
+    for sid, lists in space_lists.items():
+        team_id = space_to_team.get(sid)
+        if not team_id:
             continue
-        color = LABEL_COLORS[color_idx % len(LABEL_COLORS)]
-        color_idx += 1
-        logger.info(f"  Label: '{tag_name}' ...")
+        
+        logger.info(f"  Space '{sid}' -> team '{team_id}' ...")
+        list_label_map: Dict[str, str] = {}
+        color_idx = 0
 
-        if dry_run:
-            label_map[tag_name] = f"dry-run-label-{tag_name}"
-            logger.info(f"    [DRY-RUN] Would create label")
-            continue
+        for lst in lists:
+            list_name = lst.get("name", f"List {lst['id']}").strip().lower()
+            if not list_name:
+                continue
+            
+            logger.info(f"    Label: '{list_name}' ...")
 
-        try:
-            data = linear_query(token, CREATE_LABEL_MUTATION,
-                                {"teamId": team_id, "name": tag_name, "color": color})
-            label = data["issueLabelCreate"]["issueLabel"]
-            label_map[tag_name] = label["id"]
-            logger.info(f"    Created (id: {label['id']})")
-        except Exception as e:
-            logger.warning(f"    Skipped: {e}")
+            if dry_run:
+                list_label_map[list_name] = f"dry-run-label-{list_name}"
+                logger.info(f"    [DRY-RUN] Would create label")
+                continue
 
-    return label_map
+            color = LABEL_COLORS[color_idx % len(LABEL_COLORS)]
+            color_idx += 1
+
+            try:
+                data = linear_query(token, CREATE_LABEL_MUTATION,
+                                    {"teamId": team_id, "name": list_name, "color": color})
+                label = data["issueLabelCreate"]["issueLabel"]
+                list_label_map[list_name] = label["id"]
+                logger.info(f"    Created (id: {label['id']})")
+            except Exception as e:
+                logger.warning(f"    Skipped: {e}")
+
+        space_to_list_labels[sid] = list_label_map
+
+    return space_to_list_labels
 
 
 # ---------------------------------------------------------------------------
@@ -753,12 +811,11 @@ def extract_time_tracking_seconds(task) -> Optional[int]:
 
 def _build_issue_variables(
     team_id: str,
-    project_id: str,
     title: str,
     description: Optional[str],
     priority: Optional[int],
     state_id: str,
-    tag_ids: list,
+    label_ids: list,
     estimate: Optional[int],
     due_date: Optional[str],
     created_at: Optional[str],
@@ -767,7 +824,7 @@ def _build_issue_variables(
     """Build GraphQL variables for issue creation mutation.
     
     Only includes fields that have values to keep mutations lean.
-    Linear accepts completedAt on create, but requires createdAt to be present too.
+    Linear accepts completedAt on create.
     """
     variables = {
         "teamId": team_id,
@@ -775,14 +832,12 @@ def _build_issue_variables(
         "stateId": state_id,
     }
     
-    if project_id:
-        variables["projectId"] = project_id
     if description:
         variables["description"] = description
     if priority is not None:
         variables["priority"] = priority
-    if tag_ids:
-        variables["labelIds"] = tag_ids
+    if label_ids:
+        variables["labelIds"] = label_ids
     if estimate is not None:
         variables["estimate"] = estimate
     if due_date:
@@ -802,11 +857,11 @@ def _build_issue_variables(
 
 def migrate_tasks(
     token: str,
-    team_id: str,
-    space_to_project: dict,
-    label_map: dict,
-    state_map: dict,
-    default_state: str,
+    space_to_team: dict,
+    space_to_list_labels: dict,
+    tag_label_map: dict,
+    team_states: dict,
+    team_default_state: dict,
     tasks: list,
     dry_run: bool,
 ) -> list:
@@ -814,11 +869,11 @@ def migrate_tasks(
     
     Args:
         token: Linear API token
-        team_id: Linear team ID
-        space_to_project: Mapping of ClickUp space IDs to Linear project IDs
-        label_map: Mapping of tag names to Linear label IDs
-        state_map: Mapping of status categories to Linear state IDs
-        default_state: Default Linear state ID for unmapped statuses
+        space_to_team: Mapping of ClickUp space IDs to Linear team IDs
+        space_to_list_labels: Mapping of space_id -> {list_name: label_id}
+        tag_label_map: Mapping of tag names to Linear label IDs
+        team_states: Mapping of team_id -> state_map
+        team_default_state: Mapping of team_id -> default state ID
         tasks: List of ClickUp tasks to migrate
         dry_run: If True, preview without making API calls
         
@@ -835,12 +890,12 @@ def migrate_tasks(
     for idx, task in enumerate(tasks, 1):
         title = sanitize_name(task.get("name", "Untitled"))
         sid = str(task.get("_space_id", ""))
-        project_id = space_to_project.get(sid, "")
+        lid = str(task.get("_list_id", ""))
 
-        # Skip tasks without project mapping
-        if not project_id:
-            logger.debug(f"  [{idx}/{len(tasks)}] SKIP '{title}' - no project mapping")
-            results.append({"title": title, "status": "skipped", "reason": "no project"})
+        # Skip tasks without space mapping
+        if sid not in space_to_team:
+            logger.debug(f"  [{idx}/{len(tasks)}] SKIP '{title}' - no space mapping")
+            results.append({"title": title, "status": "skipped", "reason": "no space"})
             skipped += 1
             continue
 
@@ -851,17 +906,29 @@ def migrate_tasks(
             skipped += 1
             continue
 
+        team_id = space_to_team[sid]
+        team_state_map = team_states.get(sid, {})
+        team_default = team_default_state.get(sid, "")
+
         # Extract task fields
         priority = map_priority(extract_clickup_priority(task))
         status_name = extract_clickup_status(task)
-        state_id = map_status(status_name, state_map, default_state)
+        state_id = map_status(status_name, team_state_map, team_default)
         
-        # Extract labels
-        tag_ids = [
-            label_map[tag.get("name", "").strip().lower()]
-            for tag in task.get("tags", [])
-            if tag.get("name", "").strip().lower() in label_map
-        ]
+        # Collect labels: list label + tag labels
+        label_ids = []
+        
+        # List label (from the ClickUp list this task belongs to)
+        list_name = task.get("_list_name", "").strip().lower()
+        space_labels = space_to_list_labels.get(sid, {})
+        if list_name and list_name in space_labels:
+            label_ids.append(space_labels[list_name])
+        
+        # Tag labels (per team)
+        for tag in task.get("tags", []):
+            tag_name = tag.get("name", "").strip().lower()
+            if tag_name in tag_label_map and team_id in tag_label_map[tag_name]:
+                label_ids.append(tag_label_map[tag_name][team_id])
 
         # Extract estimate (convert seconds to minutes)
         total_seconds = extract_time_tracking_seconds(task)
@@ -884,11 +951,11 @@ def migrate_tasks(
             logger.debug(f"    Parsed: due={due_date}, created={created_at}, closed={closed_at}")
 
         # Format description
-        description = format_description(task, completed_at=closed_at if state_id == state_map.get("done") else None)
+        description = format_description(task, completed_at=closed_at if state_id == team_state_map.get("done") else None)
 
         # Dry-run mode: preview only
         if dry_run:
-            summary = f"  [{idx}/{len(tasks)}] [DRY-RUN] '{title}' -> {state_id}"
+            summary = f"  [{idx}/{len(tasks)}] [DRY-RUN] '{title}' -> team={team_id} state={state_id}"
             if estimate:
                 summary += f" ({estimate}min)"
             if closed_at:
@@ -901,8 +968,8 @@ def migrate_tasks(
 
         # Build GraphQL variables for creation
         issue_vars = _build_issue_variables(
-            team_id, project_id, title, description,
-            priority, state_id, tag_ids, estimate,
+            team_id, title, description,
+            priority, state_id, label_ids, estimate,
             due_date, created_at, closed_at
         )
 
@@ -981,29 +1048,31 @@ def main():
         print("\nNo tasks found in ClickUp. Nothing to migrate.")
         sys.exit(0)
 
-    # Phase 2: Setup Linear
-    linear_setup = setup_linear(linear_token, dry_run)
-
-    # Phase 3: Create projects
-    space_to_project = create_projects(
-        linear_token, linear_setup["team_id"],
-        clickup_data["spaces"], dry_run,
+    # Phase 2: Create teams (one per space) + fetch states
+    teams_setup = create_teams_and_states(
+        linear_token, clickup_data["spaces"], dry_run,
     )
 
-    # Phase 4: Sync labels
-    label_map = sync_labels(
-        linear_token, linear_setup["team_id"],
+    # Phase 3: Create list labels within each team
+    space_to_list_labels = create_list_labels(
+        linear_token, clickup_data["space_lists"],
+        teams_setup["space_to_team"], dry_run,
+    )
+
+    # Phase 4: Sync tag labels (global, shared across all teams)
+    tag_label_map = sync_labels(
+        linear_token, teams_setup["space_to_team"],
         clickup_data["tasks"], dry_run,
     )
 
     # Phase 5: Migrate tasks
     results = migrate_tasks(
         linear_token,
-        linear_setup["team_id"],
-        space_to_project,
-        label_map,
-        linear_setup["state_map"],
-        linear_setup["default_state"],
+        teams_setup["space_to_team"],
+        space_to_list_labels,
+        tag_label_map,
+        teams_setup["team_states"],
+        teams_setup["team_default_state"],
         clickup_data["tasks"],
         dry_run,
     )

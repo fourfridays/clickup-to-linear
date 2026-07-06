@@ -6,9 +6,10 @@ Migrates all ClickUp spaces, tasks, tags, statuses, dates, and time tracking int
 
 | ClickUp | Linear |
 |---|---|
-| Spaces (flattened) | One team + each space → a Project |
+| Spaces | One team each |
+| Lists | Labels within each team (development, documentation, etc.) |
 | Tasks | Issues |
-| Tags | Labels |
+| Tags | Labels within each team |
 | Status | Issue State |
 | Priority | Priority |
 | Time Tracking (seconds) | `estimateMinutes` |
